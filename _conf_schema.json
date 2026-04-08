@@ -1,26 +1,33 @@
 {
   "qq_list": {
     "type": "list",
-    "description": "QQ numbers to receive automatic likes once per day.",
-    "hint": "Fill in a list of QQ numbers. Each valid QQ number will be liked once per day at a random time.",
+    "description": "需要每日自动点赞的 QQ 号列表。",
+    "hint": "填写 QQ 号列表。每个有效 QQ 号每天会在随机时间被点赞一次。",
     "default": []
   },
   "like_times": {
     "type": "int",
-    "description": "How many likes to send each time.",
-    "hint": "This maps to the OneBot send_like times parameter.",
+    "description": "每次点赞的赞数。",
+    "hint": "必须是 1 到 10 之间的整数。",
     "default": 10
+  },
+  "send_mode": {
+    "type": "string",
+    "description": "点赞发送模式。",
+    "hint": "single_request 表示发送 1 次请求且 times=like_times。loop_single 表示循环发送 like_times 次请求且每次 times=1。",
+    "default": "single_request",
+    "options": ["single_request", "loop_single"]
   },
   "start_hour": {
     "type": "int",
-    "description": "Random schedule window start hour.",
-    "hint": "24-hour format. The plugin will randomly schedule likes after this hour each day.",
+    "description": "每日随机时间窗口开始小时。",
+    "hint": "24 小时制。插件会在这个小时之后随机安排当天点赞时间。",
     "default": 8
   },
   "end_hour": {
     "type": "int",
-    "description": "Random schedule window end hour.",
-    "hint": "24-hour format. The plugin will randomly schedule likes before this hour each day.",
+    "description": "每日随机时间窗口结束小时。",
+    "hint": "24 小时制。插件会在这个小时之前随机安排当天点赞时间。",
     "default": 22
   }
 }
