@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import shlex
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -68,7 +69,8 @@ class LikeLikePlugin(Star):
 
     @filter.command("likelike")
     async def likelike_status(self, event: AstrMessageEvent, args_str: str = ""):
-        tokens = self._parse_command_tokens(args_str)
+        raw_args = self._extract_command_args(event, args_str)
+        tokens = self._parse_command_tokens(raw_args)
         subcommand = tokens[0].lower() if tokens else "status"
         if subcommand == "status":
             await self._ensure_today_like_log()
@@ -590,6 +592,15 @@ class LikeLikePlugin(Star):
             return shlex.split(args_str)
         except ValueError:
             return args_str.split()
+
+    def _extract_command_args(self, event: AstrMessageEvent, fallback_args: str = "") -> str:
+        full_message = (event.message_str or event.get_message_str() or "").strip()
+        if full_message:
+            normalized = re.sub(r"\s+", " ", full_message)
+            command_match = re.match(r"^/?likelike(?:\s+(.*))?$", normalized, re.IGNORECASE)
+            if command_match:
+                return (command_match.group(1) or "").strip()
+        return fallback_args.strip()
 
     def _get_aiocqhttp_adapter(self) -> AiocqhttpAdapter | None:
         platforms = self.context.platform_manager.get_insts()
