@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import shlex
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -67,8 +68,9 @@ class LikeLikePlugin(Star):
 
     @filter.command("likelike")
     async def likelike_status(self, event: AstrMessageEvent, args_str: str = ""):
-        subcommand = args_str.strip().lower()
-        if not subcommand or subcommand == "status":
+        tokens = self._parse_command_tokens(args_str)
+        subcommand = tokens[0].lower() if tokens else "status"
+        if subcommand == "status":
             await self._ensure_today_like_log()
             await self._sync_task_state_with_logs()
             plan_day = (
@@ -102,13 +104,12 @@ class LikeLikePlugin(Star):
             yield event.plain_result("\n".join(lines))
             return
 
-        if subcommand.startswith("run"):
-            parts = subcommand.split()
-            if len(parts) != 2:
+        if subcommand == "run":
+            if len(tokens) != 2:
                 yield event.plain_result("用法：/likelike run <qq号>")
                 return
 
-            user_id = parts[1].strip()
+            user_id = tokens[1].strip()
             if user_id not in self._get_target_user_ids():
                 yield event.plain_result(f"QQ 号 {user_id} 不在 qq_list 配置中。")
                 return
@@ -139,13 +140,12 @@ class LikeLikePlugin(Star):
             )
             return
 
-        if subcommand.startswith("delete"):
-            parts = subcommand.split()
-            if len(parts) != 2:
+        if subcommand == "delete":
+            if len(tokens) != 2:
                 yield event.plain_result("用法：/likelike delete <qq号>")
                 return
 
-            user_id = parts[1].strip()
+            user_id = tokens[1].strip()
             if user_id not in self._get_target_user_ids():
                 yield event.plain_result(f"QQ 号 {user_id} 不在 qq_list 配置中。")
                 return
@@ -584,6 +584,12 @@ class LikeLikePlugin(Star):
         except (TypeError, ValueError):
             return 0
         return max(0, min(self._DAILY_LIKE_LIMIT, count))
+
+    def _parse_command_tokens(self, args_str: str) -> list[str]:
+        try:
+            return shlex.split(args_str)
+        except ValueError:
+            return args_str.split()
 
     def _get_aiocqhttp_adapter(self) -> AiocqhttpAdapter | None:
         platforms = self.context.platform_manager.get_insts()
