@@ -1,0 +1,26 @@
+{
+  "qq_list": {
+    "type": "list",
+    "description": "QQ numbers to receive automatic likes once per day.",
+    "hint": "Fill in a list of QQ numbers. Each valid QQ number will be liked once per day at a random time.",
+    "default": []
+  },
+  "like_times": {
+    "type": "int",
+    "description": "How many likes to send each time.",
+    "hint": "This maps to the OneBot send_like times parameter.",
+    "default": 10
+  },
+  "start_hour": {
+    "type": "int",
+    "description": "Random schedule window start hour.",
+    "hint": "24-hour format. The plugin will randomly schedule likes after this hour each day.",
+    "default": 8
+  },
+  "end_hour": {
+    "type": "int",
+    "description": "Random schedule window end hour.",
+    "hint": "24-hour format. The plugin will randomly schedule likes before this hour each day.",
+    "default": 22
+  }
+}

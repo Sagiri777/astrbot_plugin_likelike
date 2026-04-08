@@ -1,14 +1,24 @@
-# astrbot-plugin-helloworld
+# astrbot_plugin_likelike
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+An AstrBot plugin that schedules daily QQ likes for configured users when the active platform adapter is `aiocqhttp`.
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## Features
 
-# Supports
+- Uses AstrBot's internal `aiocqhttp` adapter instead of calling the protocol endpoint over HTTP
+- Generates one random like time per configured QQ number every day
+- Supports configurable target QQ list, like count, and random time window
+- Provides `/likelike status` and `/likelike run` commands for quick checks
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## Configuration
+
+Configure the plugin in AstrBot WebUI:
+
+- `qq_list`: list of QQ numbers to like
+- `like_times`: likes sent per target each time
+- `start_hour`: start of the daily random window
+- `end_hour`: end of the daily random window
+
+## Commands
+
+- `/likelike status`: show current plan and pending targets
+- `/likelike run`: trigger one immediate round for all configured targets
