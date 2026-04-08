@@ -27,22 +27,29 @@ class LikePlanItem:
 
 class LikeLikePlugin(Star):
     _PLAN_STORE_KEY = "daily_like_plan"
+    _LIKE_LOG_STORE_KEY = "daily_like_log"
+    _DAILY_LIKE_LIMIT = 10
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)
         self.config = config or {}
         self._data_dir = Path(get_astrbot_plugin_data_path()) / self.name
         self._plan_file = self._data_dir / "daily_like_plan.json"
+        self._like_log_file = self._data_dir / "daily_like_log.json"
         self._stop_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._current_plan_day: date | None = None
         self._current_plan: list[LikePlanItem] = []
         self._completed_user_ids: set[str] = set()
+        self._daily_like_day: date | None = None
+        self._daily_like_counts: dict[str, int] = {}
 
     async def initialize(self) -> None:
         self._stop_event.clear()
         self._data_dir.mkdir(parents=True, exist_ok=True)
         await self._restore_plan()
+        await self._restore_daily_like_log()
+        await self._sync_task_state_with_logs()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[likelike] initialized")
 
@@ -55,12 +62,15 @@ class LikeLikePlugin(Star):
             except asyncio.CancelledError:
                 pass
         await self._persist_plan()
+        await self._persist_daily_like_log()
         logger.info("[likelike] terminated")
 
     @filter.command("likelike")
     async def likelike_status(self, event: AstrMessageEvent, args_str: str = ""):
         subcommand = args_str.strip().lower()
         if not subcommand or subcommand == "status":
+            await self._ensure_today_like_log()
+            await self._sync_task_state_with_logs()
             plan_day = (
                 self._current_plan_day.isoformat() if self._current_plan_day else "N/A"
             )
@@ -75,7 +85,7 @@ class LikeLikePlugin(Star):
                 f"计划日期: {plan_day}",
             ]
             for user_id in self._get_target_user_ids():
-                total_likes = await self._get_profile_total_likes(user_id)
+                today_like_count = self._get_today_like_count(user_id)
                 schedule = next(
                     (item for item in self._current_plan if item.user_id == user_id),
                     None,
@@ -86,10 +96,9 @@ class LikeLikePlugin(Star):
                     state = f"待执行@{schedule.run_at.strftime('%H:%M:%S')}(重试{schedule.retries})"
                 else:
                     state = "已移除"
-                total_likes_text = (
-                    str(total_likes) if total_likes is not None else "未知"
+                lines.append(
+                    f"{user_id}（QQ） 今日已点赞={today_like_count} 状态={state}"
                 )
-                lines.append(f"{user_id}（QQ） 总赞数={total_likes_text} 状态={state}")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -108,15 +117,24 @@ class LikeLikePlugin(Star):
                 yield event.plain_result(f"QQ 号 {user_id} 今天的任务已经完成。")
                 return
 
-            if not await self._send_like(user_id):
+            sent_likes = await self._send_like(user_id)
+            if sent_likes is None:
                 yield event.plain_result(f"为 {user_id} 点赞失败。")
                 return
 
+            today_like_count = self._get_today_like_count(user_id)
+            if sent_likes == 0:
+                yield event.plain_result(
+                    f"{user_id} 今天已经累计点赞 {today_like_count} 次，已移除今日任务。"
+                )
+                return
+
             removed = self._remove_planned_task(user_id)
-            self._completed_user_ids.add(user_id)
-            await self._persist_plan()
+            if removed:
+                await self._persist_plan()
             yield event.plain_result(
-                f"已为 {user_id} 触发点赞。"
+                f"已为 {user_id} 触发点赞 {sent_likes} 次，"
+                f"今日累计 {today_like_count} 次。"
                 + (" 已移除该 QQ 今天的计划任务。" if removed else "")
             )
             return
@@ -151,9 +169,13 @@ class LikeLikePlugin(Star):
                 now = datetime.now().astimezone()
                 today = now.date()
 
+                await self._ensure_today_like_log(today)
+
                 if self._current_plan_day != today:
                     self._current_plan_day = today
+                    self._completed_user_ids.clear()
                     self._current_plan = self._build_plan_for_day(today)
+                    await self._sync_task_state_with_logs()
                     await self._persist_plan()
                     if self._current_plan:
                         readable_plan = ", ".join(
@@ -176,8 +198,8 @@ class LikeLikePlugin(Star):
                             self._current_plan.remove(item)
                             await self._persist_plan()
                             continue
-                        if await self._send_like(item.user_id):
-                            self._completed_user_ids.add(item.user_id)
+                        sent_likes = await self._send_like(item.user_id)
+                        if sent_likes is not None:
                             self._current_plan.remove(item)
                             await self._persist_plan()
                             continue
@@ -258,6 +280,104 @@ class LikeLikePlugin(Star):
 
         plan.sort(key=lambda item: item.run_at)
         return plan
+
+    async def _restore_daily_like_log(self) -> None:
+        stored = await self._load_persistent_like_log()
+        if not isinstance(stored, dict):
+            stored = await self.get_kv_data(self._LIKE_LOG_STORE_KEY, {})
+        if not isinstance(stored, dict):
+            self._daily_like_day = datetime.now().astimezone().date()
+            self._daily_like_counts = {}
+            return
+
+        stored_day = stored.get("day")
+        counts = stored.get("counts")
+        today = datetime.now().astimezone().date().isoformat()
+        if stored_day != today or not isinstance(counts, dict):
+            self._daily_like_day = datetime.now().astimezone().date()
+            self._daily_like_counts = {}
+            await self.delete_kv_data(self._LIKE_LOG_STORE_KEY)
+            await self._delete_persistent_like_log()
+            return
+
+        self._daily_like_day = datetime.now().astimezone().date()
+        self._daily_like_counts = {
+            str(user_id).strip(): max(0, min(self._DAILY_LIKE_LIMIT, int(count)))
+            for user_id, count in counts.items()
+            if str(user_id).strip().isdigit()
+            and isinstance(count, (int, str))
+            and str(count).strip().isdigit()
+        }
+        await self._persist_daily_like_log()
+
+    async def _ensure_today_like_log(self, today: date | None = None) -> None:
+        current_day = today or datetime.now().astimezone().date()
+        if self._daily_like_day == current_day:
+            return
+        self._daily_like_day = current_day
+        self._daily_like_counts = {}
+        await self._persist_daily_like_log()
+
+    async def _sync_task_state_with_logs(self) -> None:
+        await self._ensure_today_like_log()
+        changed = False
+        for user_id in self._get_target_user_ids():
+            if self._get_today_like_count(user_id) >= self._DAILY_LIKE_LIMIT:
+                if user_id not in self._completed_user_ids:
+                    self._completed_user_ids.add(user_id)
+                    changed = True
+                if self._remove_planned_task(user_id):
+                    changed = True
+        if changed:
+            await self._persist_plan()
+
+    async def _persist_daily_like_log(self) -> None:
+        day = self._daily_like_day or datetime.now().astimezone().date()
+        payload = {
+            "day": day.isoformat(),
+            "counts": {
+                user_id: count
+                for user_id, count in sorted(self._daily_like_counts.items())
+                if count > 0
+            },
+        }
+        await self.put_kv_data(self._LIKE_LOG_STORE_KEY, payload)
+        await self._save_persistent_like_log(payload)
+
+    async def _load_persistent_like_log(self) -> dict | None:
+        if not self._like_log_file.exists():
+            return None
+        try:
+            return await asyncio.to_thread(self._read_like_log_file)
+        except Exception as exc:
+            logger.warning("[likelike] failed to load daily like log: %s", exc)
+            return None
+
+    async def _save_persistent_like_log(self, payload: dict) -> None:
+        try:
+            await asyncio.to_thread(self._write_like_log_file, payload)
+        except Exception as exc:
+            logger.warning("[likelike] failed to save daily like log: %s", exc)
+
+    async def _delete_persistent_like_log(self) -> None:
+        try:
+            await asyncio.to_thread(self._unlink_like_log_file)
+        except Exception as exc:
+            logger.warning("[likelike] failed to delete daily like log: %s", exc)
+
+    def _read_like_log_file(self) -> dict | None:
+        with self._like_log_file.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else None
+
+    def _write_like_log_file(self, payload: dict) -> None:
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        with self._like_log_file.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+
+    def _unlink_like_log_file(self) -> None:
+        if self._like_log_file.exists():
+            self._like_log_file.unlink()
 
     async def _restore_plan(self) -> None:
         stored = await self._load_persistent_plan()
@@ -390,20 +510,32 @@ class LikeLikePlugin(Star):
         if self._plan_file.exists():
             self._plan_file.unlink()
 
-    async def _send_like(self, user_id: str) -> bool:
+    async def _send_like(self, user_id: str) -> int | None:
+        await self._ensure_today_like_log()
+
         if user_id in self._completed_user_ids:
             logger.info(
                 "[likelike] skip %s because plugin record shows it is completed today",
                 user_id,
             )
-            return True
+            return 0
+
+        today_like_count = self._get_today_like_count(user_id)
+        remaining_likes = self._DAILY_LIKE_LIMIT - today_like_count
+        if remaining_likes <= 0:
+            self._completed_user_ids.add(user_id)
+            removed = self._remove_planned_task(user_id)
+            if removed:
+                await self._persist_plan()
+            logger.info("[likelike] skip %s because today's like limit is reached", user_id)
+            return 0
 
         adapter = self._get_aiocqhttp_adapter()
         if adapter is None:
             logger.warning("[likelike] aiocqhttp adapter is not available")
-            return False
+            return None
 
-        like_times = self._get_like_times()
+        like_times = min(self._get_like_times(), remaining_likes)
         send_mode = self._get_send_mode()
 
         try:
@@ -420,64 +552,23 @@ class LikeLikePlugin(Star):
                     user_id=user_id,
                     times=like_times,
                 )
-            logger.info("[likelike] sent like to %s", user_id)
-            return True
+            self._daily_like_counts[user_id] = today_like_count + like_times
+            self._completed_user_ids.add(user_id)
+            await self._persist_daily_like_log()
+            logger.info(
+                "[likelike] sent %s like(s) to %s, today total=%s",
+                like_times,
+                user_id,
+                self._daily_like_counts[user_id],
+            )
+            return like_times
         except ActionFailed as exc:
             logger.warning("[likelike] send_like failed for %s: %s", user_id, exc)
-            return False
+            return None
         except Exception as exc:
             logger.exception(
                 "[likelike] unexpected send_like error for %s: %s", user_id, exc
             )
-            return False
-
-    async def _get_profile_like(self, user_id: str) -> dict | None:
-        adapter = self._get_aiocqhttp_adapter()
-        if adapter is None:
-            logger.warning(
-                "[likelike] aiocqhttp adapter is not available for get_profile_like"
-            )
-            return None
-
-        try:
-            result = await adapter.bot.call_action(
-                "get_profile_like",
-                user_id=user_id,
-                start=0,
-                count=10,
-            )
-        except ActionFailed as exc:
-            logger.warning(
-                "[likelike] get_profile_like failed for %s: %s", user_id, exc
-            )
-            return None
-        except Exception as exc:
-            logger.warning(
-                "[likelike] unexpected get_profile_like error for %s: %s",
-                user_id,
-                exc,
-            )
-            return None
-
-        if not isinstance(result, dict):
-            return None
-
-        data = result.get("data")
-        if isinstance(data, dict):
-            return data
-        return None
-
-    async def _get_profile_total_likes(self, user_id: str) -> int | None:
-        profile_like = await self._get_profile_like(user_id)
-        if not isinstance(profile_like, dict):
-            return None
-        favorite_info = profile_like.get("favoriteInfo")
-        if not isinstance(favorite_info, dict):
-            return None
-        total_count = favorite_info.get("total_count")
-        try:
-            return int(total_count)
-        except (TypeError, ValueError):
             return None
 
     def _remove_planned_task(self, user_id: str) -> bool:
@@ -486,6 +577,13 @@ class LikeLikePlugin(Star):
             item for item in self._current_plan if item.user_id != user_id
         ]
         return len(self._current_plan) != original_len
+
+    def _get_today_like_count(self, user_id: str) -> int:
+        try:
+            count = int(self._daily_like_counts.get(user_id, 0))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(self._DAILY_LIKE_LIMIT, count))
 
     def _get_aiocqhttp_adapter(self) -> AiocqhttpAdapter | None:
         platforms = self.context.platform_manager.get_insts()

@@ -24,6 +24,6 @@
 
 ## 指令
 
-- `/likelike status`：显示每个 QQ 的任务状态和通过协议端接口获取到的总赞数
+- `/likelike status`：显示每个 QQ 的任务状态和插件记录的今日点赞数
 - `/likelike run <qq号>`：立即为指定 QQ 点赞，成功后移除今天的计划任务
 - `/likelike delete <qq号>`：移除指定 QQ 今天的计划任务
