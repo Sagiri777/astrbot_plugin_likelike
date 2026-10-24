@@ -1,7 +1,7 @@
 name: likelike
 display_name: LikeLike
-desc: Schedule daily random QQ likes through the aiocqhttp adapter.
-version: v0.2.0
+desc: Schedule daily random QQ likes through the aiocqhttp adapter and NapCat.
+version: v0.3.0
 author: Sagiri777
 repo: https://github.com/Sagiri777/astrbot_plugin_likelike
 support_platforms:

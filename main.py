@@ -8,6 +8,7 @@ import shlex
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 from aiocqhttp.exceptions import ActionFailed
 
@@ -25,6 +26,12 @@ class LikePlanItem:
     user_id: str
     run_at: datetime
     retries: int = 0
+
+
+@dataclass(slots=True)
+class LikeResult:
+    sent: int
+    completed: bool
 
 
 class LikeLikePlugin(Star):
@@ -45,6 +52,7 @@ class LikeLikePlugin(Star):
         self._completed_user_ids: set[str] = set()
         self._daily_like_day: date | None = None
         self._daily_like_counts: dict[str, int] = {}
+        self._like_locks: dict[str, asyncio.Lock] = {}
 
     async def initialize(self) -> None:
         self._stop_event.clear()
@@ -107,7 +115,7 @@ class LikeLikePlugin(Star):
             return
 
         if subcommand == "run":
-            if len(tokens) != 2:
+            if len(tokens) != 2 or not tokens[1].strip().isdigit():
                 yield event.plain_result("用法：/likelike run <qq号>")
                 return
 
@@ -116,29 +124,31 @@ class LikeLikePlugin(Star):
                 yield event.plain_result(f"QQ 号 {user_id} 不在 qq_list 配置中。")
                 return
 
-            if user_id in self._completed_user_ids:
-                yield event.plain_result(f"QQ 号 {user_id} 今天的任务已经完成。")
-                return
-
-            sent_likes = await self._send_like(user_id)
-            if sent_likes is None:
-                yield event.plain_result(f"为 {user_id} 点赞失败。")
+            result = await self._send_like(user_id)
+            if result is None:
+                yield event.plain_result(f"为 {user_id} 点赞失败，请稍后重试。")
                 return
 
             today_like_count = self._get_today_like_count(user_id)
-            if sent_likes == 0:
+            if result.sent == 0:
                 yield event.plain_result(
                     f"{user_id} 今天已经累计点赞 {today_like_count} 次，已移除今日任务。"
                 )
                 return
 
-            removed = self._remove_planned_task(user_id)
-            if removed:
-                await self._persist_plan()
+            removed = False
+            if result.completed:
+                removed = self._remove_planned_task(user_id)
+                if removed:
+                    await self._persist_plan()
+            suffix = (
+                " 已移除该 QQ 今天的计划任务。"
+                if removed
+                else " 本次仅部分成功，今日计划保留，可稍后重试。"
+            )
             yield event.plain_result(
-                f"已为 {user_id} 触发点赞 {sent_likes} 次，"
-                f"今日累计 {today_like_count} 次。"
-                + (" 已移除该 QQ 今天的计划任务。" if removed else "")
+                f"已为 {user_id} 触发点赞 {result.sent} 次，"
+                f"今日累计 {today_like_count} 次。" + suffix
             )
             return
 
@@ -200,8 +210,8 @@ class LikeLikePlugin(Star):
                             self._current_plan.remove(item)
                             await self._persist_plan()
                             continue
-                        sent_likes = await self._send_like(item.user_id)
-                        if sent_likes is not None:
+                        result = await self._send_like(item.user_id)
+                        if result is not None and result.completed:
                             self._current_plan.remove(item)
                             await self._persist_plan()
                             continue
@@ -373,9 +383,7 @@ class LikeLikePlugin(Star):
         return data if isinstance(data, dict) else None
 
     def _write_like_log_file(self, payload: dict) -> None:
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-        with self._like_log_file.open("w", encoding="utf-8") as file:
-            json.dump(payload, file, ensure_ascii=False, indent=2)
+        self._write_json_atomic(self._like_log_file, payload)
 
     def _unlink_like_log_file(self) -> None:
         if self._like_log_file.exists():
@@ -394,13 +402,13 @@ class LikeLikePlugin(Star):
         today = datetime.now().astimezone().date().isoformat()
 
         if stored_day != today:
-            await self.delete_kv_data(self._PLAN_STORE_KEY)
+            await self._clear_stored_plan()
             return
         if config_snapshot != self._build_config_snapshot():
-            await self.delete_kv_data(self._PLAN_STORE_KEY)
+            await self._clear_stored_plan()
             return
         if not isinstance(items, list):
-            await self.delete_kv_data(self._PLAN_STORE_KEY)
+            await self._clear_stored_plan()
             return
 
         restored_items: list[LikePlanItem] = []
@@ -420,6 +428,8 @@ class LikeLikePlugin(Star):
                 continue
             try:
                 run_at = datetime.fromisoformat(run_at_raw)
+                if run_at.tzinfo is None:
+                    run_at = run_at.replace(tzinfo=datetime.now().astimezone().tzinfo)
                 retries = int(retries_raw)
             except (TypeError, ValueError):
                 continue
@@ -431,18 +441,21 @@ class LikeLikePlugin(Star):
                 )
             )
 
-        if not restored_items:
-            await self.delete_kv_data(self._PLAN_STORE_KEY)
-            return
-
-        restored_items.sort(key=lambda item: item.run_at)
         self._current_plan_day = datetime.now().astimezone().date()
-        self._current_plan = restored_items
-        logger.info(
-            "[likelike] restored %s pending task(s) from plugin storage",
-            len(restored_items),
-        )
-        await self.put_kv_data(self._PLAN_STORE_KEY, stored)
+        self._current_plan = sorted(restored_items, key=lambda item: item.run_at)
+        if restored_items:
+            logger.info(
+                "[likelike] restored %s pending task(s) from plugin storage",
+                len(restored_items),
+            )
+        await self._persist_plan()
+
+    async def _clear_stored_plan(self) -> None:
+        self._current_plan_day = None
+        self._current_plan = []
+        self._completed_user_ids.clear()
+        await self.delete_kv_data(self._PLAN_STORE_KEY)
+        await self._delete_persistent_plan()
 
     async def _persist_plan(self) -> None:
         if self._current_plan_day is None:
@@ -504,15 +517,26 @@ class LikeLikePlugin(Star):
         return data if isinstance(data, dict) else None
 
     def _write_json_file(self, payload: dict) -> None:
+        self._write_json_atomic(self._plan_file, payload)
+
+    def _write_json_atomic(self, path: Path, payload: dict) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        with self._plan_file.open("w", encoding="utf-8") as file:
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.flush()
+        temp_path.replace(path)
 
     def _unlink_plan_file(self) -> None:
         if self._plan_file.exists():
             self._plan_file.unlink()
 
-    async def _send_like(self, user_id: str) -> int | None:
+    async def _send_like(self, user_id: str) -> LikeResult | None:
+        lock = self._like_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            return await self._send_like_locked(user_id)
+
+    async def _send_like_locked(self, user_id: str) -> LikeResult | None:
         await self._ensure_today_like_log()
 
         if user_id in self._completed_user_ids:
@@ -520,7 +544,7 @@ class LikeLikePlugin(Star):
                 "[likelike] skip %s because plugin record shows it is completed today",
                 user_id,
             )
-            return 0
+            return LikeResult(sent=0, completed=True)
 
         today_like_count = self._get_today_like_count(user_id)
         remaining_likes = self._DAILY_LIKE_LIMIT - today_like_count
@@ -530,40 +554,38 @@ class LikeLikePlugin(Star):
             if removed:
                 await self._persist_plan()
             logger.info("[likelike] skip %s because today's like limit is reached", user_id)
-            return 0
+            return LikeResult(sent=0, completed=True)
 
-        adapter = self._get_aiocqhttp_adapter()
-        if adapter is None:
+        client = self._get_aiocqhttp_client()
+        if client is None:
             logger.warning("[likelike] aiocqhttp adapter is not available")
             return None
 
         like_times = min(self._get_like_times(), remaining_likes)
         send_mode = self._get_send_mode()
+        sent_likes = 0
 
         try:
             if send_mode == "loop_single":
                 for _ in range(like_times):
-                    await adapter.bot.call_action(
-                        "send_like",
-                        user_id=user_id,
-                        times=1,
-                    )
+                    try:
+                        await self._call_send_like(client, user_id, 1)
+                    except Exception as exc:
+                        logger.warning(
+                            "[likelike] send_like failed for %s after %s successful like(s): %s",
+                            user_id,
+                            sent_likes,
+                            exc,
+                        )
+                        break
+                    sent_likes += 1
+                    self._daily_like_counts[user_id] = today_like_count + sent_likes
+                    await self._persist_daily_like_log()
             else:
-                await adapter.bot.call_action(
-                    "send_like",
-                    user_id=user_id,
-                    times=like_times,
-                )
-            self._daily_like_counts[user_id] = today_like_count + like_times
-            self._completed_user_ids.add(user_id)
-            await self._persist_daily_like_log()
-            logger.info(
-                "[likelike] sent %s like(s) to %s, today total=%s",
-                like_times,
-                user_id,
-                self._daily_like_counts[user_id],
-            )
-            return like_times
+                await self._call_send_like(client, user_id, like_times)
+                sent_likes = like_times
+                self._daily_like_counts[user_id] = today_like_count + sent_likes
+                await self._persist_daily_like_log()
         except ActionFailed as exc:
             logger.warning("[likelike] send_like failed for %s: %s", user_id, exc)
             return None
@@ -572,6 +594,31 @@ class LikeLikePlugin(Star):
                 "[likelike] unexpected send_like error for %s: %s", user_id, exc
             )
             return None
+
+        completed = sent_likes == like_times
+        if completed:
+            self._completed_user_ids.add(user_id)
+        if sent_likes:
+            logger.info(
+                "[likelike] sent %s like(s) to %s, today total=%s",
+                sent_likes,
+                user_id,
+                self._daily_like_counts[user_id],
+            )
+            return LikeResult(sent=sent_likes, completed=completed)
+        return None
+
+    async def _call_send_like(self, client: Any, user_id: str, times: int) -> None:
+        payload = {"user_id": user_id, "times": times}
+        api = getattr(client, "api", None)
+        if api is not None and callable(getattr(api, "call_action", None)):
+            await api.call_action("send_like", **payload)
+            return
+        call_action = getattr(client, "call_action", None)
+        if callable(call_action):
+            await call_action("send_like", **payload)
+            return
+        raise RuntimeError("当前 aiocqhttp 客户端不支持 call_action")
 
     def _remove_planned_task(self, user_id: str) -> bool:
         original_len = len(self._current_plan)
@@ -602,7 +649,26 @@ class LikeLikePlugin(Star):
                 return (command_match.group(1) or "").strip()
         return fallback_args.strip()
 
+    def _get_aiocqhttp_client(self) -> Any | None:
+        adapter = self._get_aiocqhttp_adapter()
+        if adapter is None:
+            return None
+        get_client = getattr(adapter, "get_client", None)
+        if callable(get_client):
+            return get_client()
+        return getattr(adapter, "bot", None)
+
     def _get_aiocqhttp_adapter(self) -> AiocqhttpAdapter | None:
+        get_platform = getattr(self.context, "get_platform", None)
+        if callable(get_platform):
+            try:
+                from astrbot.api.event.filter import PlatformAdapterType
+
+                platform = get_platform(PlatformAdapterType.AIOCQHTTP)
+                if isinstance(platform, AiocqhttpAdapter):
+                    return platform
+            except (AttributeError, ImportError, TypeError):
+                pass
         platforms = self.context.platform_manager.get_insts()
         return next(
             (
